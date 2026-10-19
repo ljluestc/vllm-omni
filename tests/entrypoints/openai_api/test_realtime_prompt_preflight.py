@@ -741,6 +741,52 @@ async def test_generated_audio_is_resampled_to_realtime_rate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_response_done_usage_reports_cached_tokens() -> None:
+    outputs = [
+        SimpleNamespace(
+            final_output_type="text",
+            prompt_token_ids=list(range(40)),
+            num_cached_tokens=32,
+            outputs=[SimpleNamespace(text=text, token_ids=[index], finish_reason=None)],
+        )
+        for index, text in enumerate(["Hello", " world"])
+    ]
+
+    async def generate(**_kwargs):
+        for output in outputs:
+            yield output
+
+    model_config = SimpleNamespace(max_model_len=100, multimodal_config=None)
+    engine = SimpleNamespace(
+        model_config=model_config,
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["text"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+
+    events = [json.loads(message) for message in websocket.messages]
+    (done,) = [event for event in events if event["type"] == "response.done"]
+    usage = done["response"]["usage"]
+    assert usage["input_tokens"] == 40
+    assert usage["output_tokens"] == 2
+    assert usage["input_token_details"]["cached_tokens"] == 32
+
+
+@pytest.mark.asyncio
 async def test_minicpmo45_realtime_keeps_thinker_final_only() -> None:
     model_arch = "MiniCPMO45OmniForConditionalGeneration"
     stages = [

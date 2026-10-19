@@ -43,6 +43,7 @@ event is base64-encoded raw PCM16.
 | Server to client | `transcription.done` | Carries final text and token usage |
 | Server to client | `response.output_audio.delta` | Carries incremental PCM16 response audio |
 | Server to client | `response.output_audio.done` | Marks the end of response audio |
+| Server to client | `response.done` | Ends the response. `usage.input_token_details.cached_tokens` reports prefix-cache hits |
 | Server to client | `error` | Reports an invalid event, model, or audio payload |
 
 A minimal client sends events in this order:

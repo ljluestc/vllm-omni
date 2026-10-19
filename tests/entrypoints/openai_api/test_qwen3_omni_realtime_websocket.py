@@ -3,10 +3,12 @@
 """
 E2E online tests for Qwen3-Omni /v1/realtime WebSocket (streaming PCM in, audio out).
 
-Four scenarios:
+Five scenarios:
 - Ready CI: async_chunk on, smoke only (no send delay, no accuracy check).
 - Merge CI: async_chunk on + send delay, full accuracy check.
 - Merge CI: async_chunk off, no send delay, full accuracy check.
+- Merge CI: async_chunk on + thinker/talker prefix cache, replayed input must
+  hit the cache and keep full accuracy (#2960).
 - Server VAD: two turns without client commits.
 """
 
@@ -97,6 +99,27 @@ realtime_async_chunk_server_params = [
     ),
 ]
 
+# Same cache overrides as the chat prefix-cache E2E in
+# ``tests/e2e/online_serving/test_qwen3_omni.py``.
+PREFIX_CACHE_BLOCK_SIZE = 16
+realtime_prefix_cache_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=default_stage_config,
+            use_stage_cli=True,
+            server_args=[
+                "--async-chunk",
+                "--block-size",
+                str(PREFIX_CACHE_BLOCK_SIZE),
+                "--stage-overrides",
+                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
+            ],
+        ),
+        id="async_chunk_prefix_cache",
+    ),
+]
+
 realtime_server_vad_server_params = [
     pytest.param(
         OmniServerParams(
@@ -149,6 +172,7 @@ async def _run_realtime_audio_roundtrip(
     final_text = ""
     delta_events = 0
     audio_done = False
+    usage: dict = {}
 
     bytes_per_ms = 24000 * 2 // 1000
     chunk_bytes = max(bytes_per_ms * chunk_ms, 2)
@@ -219,6 +243,7 @@ async def _run_realtime_audio_roundtrip(
                 continue
 
             if event_type == "response.done":
+                usage = event.get("response", {}).get("usage") or {}
                 break
 
             if event_type == "error":
@@ -233,6 +258,7 @@ async def _run_realtime_audio_roundtrip(
         "transcription_text": final_text or "".join(text_chunks),
         "delta_events": delta_events,
         "audio_done": audio_done,
+        "usage": usage,
     }
 
 
@@ -638,6 +664,45 @@ class TestQwen3OmniRealtimeWebSocket:
 
         assert len(set(input_item_ids)) == 2
         assert len(set(response_ids)) == 2
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_prefix_cache_server_params, indirect=True)
+    def test_streaming_audio_input_prefix_cache_async_chunk(self, omni_server) -> None:
+        """Merge CI: streaming input + prefix cache (#2960 combination 1).
+
+        Replays the same paced upload on two sessions. The second response
+        must report a block-aligned thinker cache hit and still pass the
+        same accuracy gate as the uncached baseline.
+        """
+        pcm16 = _synthetic_pcm16_input()
+
+        results = [
+            asyncio.run(
+                _run_realtime_audio_roundtrip(
+                    omni_server.host,
+                    omni_server.port,
+                    omni_server.model,
+                    pcm16,
+                    chunk_ms=100,
+                    send_delay_ms=SEND_DELAY_MS,
+                )
+            )
+            for _ in range(2)
+        ]
+
+        for result in results:
+            _assert_realtime_smoke(result)
+            _assert_realtime_accuracy(result)
+
+        usage = results[1]["usage"]
+        input_tokens = usage.get("input_tokens")
+        cached_tokens = (usage.get("input_token_details") or {}).get("cached_tokens")
+        assert input_tokens, f"Missing input_tokens in response.done usage: {usage}"
+        assert cached_tokens, f"Replayed streaming input did not hit the prefix cache: {usage}"
+        assert cached_tokens % PREFIX_CACHE_BLOCK_SIZE == 0, usage
+        assert cached_tokens <= input_tokens, usage
 
     @pytest.mark.advanced_model
     @pytest.mark.omni

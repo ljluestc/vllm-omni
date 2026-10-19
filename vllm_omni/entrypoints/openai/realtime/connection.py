@@ -1124,6 +1124,9 @@ class OpenAIFullDuplexConnection:
 
                     if output.prompt_token_ids:
                         usage.input_tokens = max(usage.input_tokens, len(output.prompt_token_ids))
+                    num_cached_tokens = getattr(output, "num_cached_tokens", None)
+                    if num_cached_tokens:
+                        usage.cached_tokens = max(usage.cached_tokens, num_cached_tokens)
 
                     if tool_parser is not None:
                         # Additive branch: when no tools are configured for
@@ -1409,6 +1412,7 @@ class OpenAIFullDuplexConnection:
                 "total_tokens": usage.total_tokens,
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
+                "input_token_details": {"cached_tokens": usage.cached_tokens},
             },
         )
 
