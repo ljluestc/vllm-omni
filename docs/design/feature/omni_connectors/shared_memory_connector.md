@@ -166,18 +166,51 @@ This path is mainly for older code paths and is not the preferred mode for the c
 `put()` writes every serialized payload to shared memory. The connector has no
 inline-payload path or size threshold.
 
-#### 6.2 Cleanup Is Currently Passive
+#### 6.2 Cleanup Ownership
 
-`cleanup()` is currently a no-op. The intended assumption is:
+The consumer owns the normal path: a successful `get()` reads the segment,
+unlinks it and removes its lock file.
 
-- the consumer reads the segment
-- the underlying shared-memory helpers unlink it
+The producer owns abnormal paths. Every successful `put()` records its key
+until a consumer has unlinked the segment:
 
-If the consumer never executes `get()`, the shared-memory segment may remain allocated. This means the connector relies on the normal success path for resource reclamation.
+- `cleanup(key)` unlinks the exact key passed to `put()` if it is still
+  unconsumed. The chunk transfer adapter calls it for every chunk of an
+  aborted request.
+- `cleanup_prefix(prefix)` unlinks the tracked chunk keys `{prefix}{chunk_id}`
+  of one request without touching other requests that share the prefix. The
+  orchestrator triggers it after all stages finish a request, for chunks a
+  consumer stopped reading early.
+- `reap_consumed()` drops records for keys another process already unlinked,
+  so the tracked set stays bounded.
 
-#### 6.3 Close Is Currently Minimal
+Limitations:
 
-`close()` is also a no-op. There is no connector-owned background thread, socket, or memory pool to tear down, so the lifecycle is simple. The trade-off is that `close()` does not scan or recover leaked shared-memory resources.
+- Only keys put by this connector instance are tracked. Segments left by a
+  producer process that died are reclaimed by Python's `resource_tracker`, not
+  by the connector.
+- Cleanup is best-effort. A failed unlink is logged and counted, but not
+  retried.
+
+#### 6.3 Close
+
+`close()` unlinks every tracked unconsumed segment and removes this
+connector's wakeup FIFO. It logs the number of segments it reclaimed.
+
+#### 6.4 Observability
+
+`health()` returns these counters:
+
+| Counter | Meaning |
+| --- | --- |
+| `puts`, `gets`, `bytes_transferred` | Successful transfers. |
+| `errors` | `put()` or `get()` failures, excluding a segment that is not ready yet. |
+| `orphan_cleanups` | Unconsumed segments unlinked by `cleanup()` or `close()`. |
+| `cleanup_failures` | Unlinks that failed in `cleanup()`; also logged as warnings. |
+
+A rising `orphan_cleanups` means producers write payloads that no consumer
+reads, for example because requests are aborted. A non-zero `cleanup_failures`
+means segments may remain in `/dev/shm`.
 
 ### 7. Data Flow in the Pipeline
 
@@ -217,7 +250,7 @@ This is a classic split-control-plane / data-plane design, but constrained to a 
 
 - Same-node only.
 - Full object serialization and deserialization are still required.
-- Resource cleanup depends on the normal consumer path.
+- Abnormal-path cleanup is best-effort and limited to keys tracked by the producer.
 - Shared memory capacity is limited by host configuration.
 
 ### 9. Summary

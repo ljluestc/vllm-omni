@@ -67,6 +67,11 @@ class SharedMemoryConnector(OmniConnectorBase):
             "puts": 0,
             "gets": 0,
             "bytes_transferred": 0,
+            # put/get failures other than "segment not there yet".
+            "errors": 0,
+            # Unconsumed segments unlinked by cleanup()/close() (abort/orphan paths).
+            "orphan_cleanups": 0,
+            "cleanup_failures": 0,
         }
         # Receiver side: FIFO read end (plus a write end of our own, so the
         # FIFO never reports EOF when no sender has it open) and a counter of
@@ -224,6 +229,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             return True, size, metadata
 
         except Exception as e:
+            self._metrics["errors"] += 1
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
@@ -241,6 +247,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         except BlockingIOError:
             return None
         except Exception as e:
+            self._metrics["errors"] += 1
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
@@ -272,9 +279,11 @@ class SharedMemoryConnector(OmniConnectorBase):
             # so async polling can retry without a traceback.
             if "empty file" in str(e):
                 return None
+            self._metrics["errors"] += 1
             logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
             return None
         except Exception:
+            self._metrics["errors"] += 1
             logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
             return None
         finally:
@@ -324,10 +333,12 @@ class SharedMemoryConnector(OmniConnectorBase):
                 seg.unlink()
                 logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
                 unlinked = True
+                self._metrics["orphan_cleanups"] += 1
             except FileNotFoundError:
                 pass
             except Exception as e:
-                logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
+                self._metrics["cleanup_failures"] += 1
+                logger.warning("cleanup: failed to unlink SHM segment %s: %s", key, e)
             lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
             if os.path.exists(lock_file):
                 try:
@@ -351,8 +362,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         """Unlink all remaining tracked SHM segments."""
         with self._pending_keys_lock:
             keys = list(self._pending_keys)
-        for key in keys:
-            self.cleanup(key)
+        reclaimed = sum(self.cleanup(key) for key in keys)
+        if reclaimed:
+            logger.info("SharedMemoryConnector close: unlinked %d unconsumed SHM segment(s)", reclaimed)
         self._close_wakeups()
 
     def reap_consumed(self, *, max_keys: int = 64) -> None:

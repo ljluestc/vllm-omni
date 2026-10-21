@@ -6,6 +6,7 @@ import fcntl
 import os
 import time
 import uuid
+from multiprocessing import shared_memory as shm_pkg
 
 import pytest
 import torch
@@ -631,3 +632,59 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         assert not connector._pending_keys
     finally:
         receiver.close()
+
+
+def test_health_counts_orphan_cleanups(connector):
+    connector.put("s0", "s1", "orphan_metric_0", {"i": 0})
+    connector.put("s0", "s1", "orphan_metric_1", {"i": 1})
+    connector.get("s0", "s1", "orphan_metric_1", metadata=None)
+
+    assert connector.cleanup("orphan_metric_0") is True
+    assert connector.cleanup("orphan_metric_1") is False
+
+    health = connector.health()
+    assert health["orphan_cleanups"] == 1
+    assert health["cleanup_failures"] == 0
+    assert health["errors"] == 0
+
+
+def test_close_counts_orphan_cleanups():
+    c = SharedMemoryConnector({})
+    for i in range(2):
+        c.put("s0", "s1", f"orphan_close_{uuid.uuid4().hex}", {"i": i})
+    c.close()
+    assert c.health()["orphan_cleanups"] == 2
+
+
+def test_health_counts_failed_cleanup(connector, monkeypatch):
+    connector.put("s0", "s1", "orphan_fail_metric", {"x": 1})
+
+    def fail_unlink(self):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(shm_pkg.SharedMemory, "unlink", fail_unlink)
+    assert connector.cleanup("orphan_fail_metric") is False
+    monkeypatch.undo()
+
+    health = connector.health()
+    assert health["cleanup_failures"] == 1
+    assert health["orphan_cleanups"] == 0
+    shm_pkg.SharedMemory(name="orphan_fail_metric").unlink()
+
+
+def test_health_counts_put_and_get_errors(connector, monkeypatch):
+    def fail_serialize(data):
+        raise RuntimeError("bad payload")
+
+    monkeypatch.setattr(connector, "serialize_obj", fail_serialize)
+    assert connector.put("s0", "s1", "error_metric_put", {"x": 1}) == (False, 0, None)
+    monkeypatch.undo()
+
+    connector.put("s0", "s1", "error_metric_get", {"x": 1})
+    monkeypatch.setattr(connector, "deserialize_obj", fail_serialize)
+    assert connector.get("s0", "s1", "error_metric_get", metadata=None) is None
+    assert connector.health()["errors"] == 2
+
+    # A key that was never written is "not ready", not an error.
+    assert connector.get("s0", "s1", "error_metric_missing", metadata=None) is None
+    assert connector.health()["errors"] == 2
